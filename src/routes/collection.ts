@@ -17,7 +17,7 @@ export const getCollectionData = async (
   raw?: boolean,
   filter?: any,
   sort?: any,
-  limit,
+  limit?: number,
 ) => {
 
   // console.log('Getting collection data:', collection, collectionViewId, notionToken, raw, filter)
@@ -32,12 +32,23 @@ export const getCollectionData = async (
 
   // console.log('fetchTableData:::::::::', table)
 
-  const collectionRows = collection.value.schema;
+  const collectionRows = collection.value?.schema;
+  // console.log('[getCollectionData] collectionRows:::::::::', collectionRows)
+  if (!collectionRows) {
+    throw new Error("Collection schema not found");
+  }
   const collectionColKeys = Object.keys(collectionRows);
 
-  const tableArr: RowType[] = table.result.reducerResults.collection_group_results.blockIds.map(
+  // Add safety checks for table structure
+  const blockIds = table?.result?.reducerResults?.collection_group_results?.blockIds;
+  if (!blockIds || !Array.isArray(blockIds)) {
+    console.warn("No block IDs found in collection response");
+    return { rows: [], schema: collectionRows, name: collection.value?.name?.join('') || '', tableArr: [] };
+  }
+
+  const tableArr: RowType[] = blockIds.map(
     (id: string) => table.recordMap.block[id]
-  );
+  ).filter(Boolean); // Filter out undefined entries
 
 
 
@@ -52,35 +63,93 @@ export const getCollectionData = async (
   const rows: Row[] = [];
   const tds = []
 
-  
+  // Collect all user IDs to batch fetch later
+  const allUserIds = new Set<string>();
+  const personFieldsToResolve: { rowIndex: number; fieldName: string; userIds: string[] }[] = [];
+  const createdByToResolve: { rowIndex: number; userId: string }[] = [];
+  const assetsToResolve: { rowIndex: number; url: string; blockId: string }[] = [];
 
-  for (const tableRow of tableData) {
-    // console.log('tableRow:', tableRow)
+  // First pass: collect data and user IDs without making individual API calls
+  for (let i = 0; i < tableData.length; i++) {
+    const tableRow = tableData[i];
     let row: Row = { id: tableRow.value.id, format: tableRow.value.format };
     tds.push(tableRow)
+    
     for (const key of collectionColKeys) {
-      const val = tableRow.value.properties[key];
+      const val = tableRow.value.properties?.[key];
       if (val) {
         const schema = collectionRows[key];
         row[schema.name] = raw ? val : getNotionValue(val, schema.type, tableRow);
         if (schema.type === "person" && row[schema.name]) {
-          const users = await fetchNotionUsers(row[schema.name] as string[]);
-          row[schema.name] = users as any;
+          const userIds = row[schema.name] as string[];
+          userIds.forEach(id => allUserIds.add(id));
+          personFieldsToResolve.push({ rowIndex: i, fieldName: schema.name, userIds });
         }
       }
     }
 
+    // Collect page cover assets to resolve
     if(row.format && row.format.page_cover) {
-      let asset:any = await fetchNotionAsset(row.format.page_cover, row.id)
-      if (asset && asset.url && asset.url.signedUrls && asset.url.signedUrls[0])
-        row.format.page_cover = asset.url.signedUrls[0]
+      assetsToResolve.push({ rowIndex: i, url: row.format.page_cover, blockId: row.id });
     }
 
-    row['Created By'] = await fetchNotionUsers([tableRow.value?.['created_by_id']]);
+    // Collect Created By user IDs
+    const createdById = tableRow.value?.['created_by_id'];
+    if (createdById) {
+      allUserIds.add(createdById);
+      createdByToResolve.push({ rowIndex: i, userId: createdById });
+    }
+
     rows.push(row);
   }
 
-  const name: String = collection.value.name.join('')
+  // Batch fetch all users at once (single API call instead of one per row)
+  let userMap: Record<string, any> = {};
+  if (allUserIds.size > 0) {
+    try {
+      const allUsers = await fetchNotionUsers(Array.from(allUserIds), notionToken);
+      allUsers.forEach((user: any) => {
+        if (user && user.id) {
+          userMap[user.id] = user;
+        }
+      });
+    } catch (err) {
+      console.warn("Failed to fetch users:", err);
+      // Continue without user data
+    }
+  }
+
+  // Resolve person fields using the batched user data
+  for (const { rowIndex, fieldName, userIds } of personFieldsToResolve) {
+    rows[rowIndex][fieldName] = userIds.map(id => userMap[id]).filter(Boolean) as any;
+  }
+
+  // Resolve Created By using the batched user data
+  for (const { rowIndex, userId } of createdByToResolve) {
+    rows[rowIndex]['Created By'] = userMap[userId] ? [userMap[userId]] : [];
+  }
+
+  // Fetch assets in parallel (not sequentially)
+  if (assetsToResolve.length > 0) {
+    try {
+      const assetPromises = assetsToResolve.map(async ({ rowIndex, url, blockId }) => {
+        try {
+          const asset: any = await fetchNotionAsset(url, blockId);
+          if (asset?.url?.signedUrls?.[0]) {
+            rows[rowIndex].format.page_cover = asset.url.signedUrls[0];
+          }
+        } catch (err) {
+          console.warn("Failed to fetch asset for block:", blockId, err);
+          // Keep original URL on failure
+        }
+      });
+      await Promise.all(assetPromises);
+    } catch (err) {
+      console.warn("Failed to fetch assets:", err);
+    }
+  }
+
+  const name: String = collection.value?.name?.join('') || '';
 
   return { rows, schema: collectionRows, name, tableArr};
 };
@@ -109,8 +178,36 @@ export async function collectionRoute(req: HandlerRequest) {
   const pageId = parsePageId(req.params.pageId);
   const viewName = req.searchParams.get("view"); // collection view
   const limit = Number(req.searchParams.get("limit")) || 999; // collection view
-  const page = await fetchPageById(pageId!, req.notionToken);
-  const pageBlock = page.recordMap.block[pageId!];
+  
+  let page;
+  try {
+    page = await fetchPageById(pageId!, req.notionToken);
+  } catch (err) {
+    console.error("Failed to fetch page from Notion:", err);
+    return createResponse(
+      { error: "Failed to fetch data from Notion. The API may be temporarily unavailable.", pageId },
+      {},
+      503
+    );
+  }
+
+  if (!page || !page.recordMap) {
+    return createResponse(
+      { error: "Invalid response from Notion API", pageId },
+      {},
+      502
+    );
+  }
+
+  const pageBlock = page.recordMap.block?.[pageId!];
+  if (!pageBlock) {
+    return createResponse(
+      { error: "Page block not found in Notion response", pageId },
+      {},
+      404
+    );
+  }
+
   let payload: string|null = req.searchParams.get("payload"); // ["rows", "columns"] etc. — array of keys to be returned; will return EVERYTHING if left empty
   let payloadArr: string[] = [];
   if (payload) payloadArr = payload.split(',')
@@ -186,15 +283,25 @@ export async function collectionRoute(req: HandlerRequest) {
 
 
 
-  const tableData = await getCollectionData(
-    collection,
-    collectionView.value.id,
-    req.notionToken,
-    null,
-    query_filter,
-    query_sort,
-    limit,
-  );
+  let tableData;
+  try {
+    tableData = await getCollectionData(
+      collection,
+      collectionView.value.id,
+      req.notionToken,
+      undefined,
+      query_filter,
+      query_sort,
+      limit,
+    );
+  } catch (err) {
+    console.error("Failed to get collection data:", err);
+    return createResponse(
+      { error: "Failed to fetch collection data from Notion", message: String(err), pageId },
+      {},
+      503
+    );
+  }
 
   // console.log('[collection] table data:', JSON.stringify(collectionView.value))
   // console.log('[collection] view:', JSON.stringify(page.recordMap))
@@ -203,7 +310,7 @@ export async function collectionRoute(req: HandlerRequest) {
   const tableProps = collectionView.value.format.table_properties
   if(tableProps) {// only table views have tableProps; galleries etc. don't
     tableProps.map((tableCol:any, i:any) => {
-      tableProps[i] = { ...tableProps[i], ...tableData.schema[tableCol['property']] }
+      tableProps[i] = { ...tableProps[i], ...tableData?.schema[tableCol['property']] }
     })
   }
 

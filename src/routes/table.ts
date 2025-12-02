@@ -14,30 +14,33 @@ export const getTableData = async (
   notionToken?: string,
   raw?: boolean
 ) => {
-
-
-
   let table: any; // no idea what this is lol
 
   if(collection) {
       table = await fetchTableData(
       collection?.value?.id,
       collectionViewId,
-      notionToken
+      notionToken!,
+      {},
+      [],
+      999
     );
   }
 
-  const collectionRows = collection?.value.schema;
-  const collectionColKeys = Object.keys(collectionRows);
-
+  const collectionRows = collection?.value?.schema;
+  // console.log('[getTableData] collectionRows:::::::::', {collectionRows: JSON.stringify(collectionRows), keys: Object.keys(collectionRows || {})})
+  const collectionColKeys = Object.keys(collectionRows || {});
+  // console.log('[getTableData] collectionColKeys:::::::::', collectionColKeys)
   // console.log('>>>>> table block ids?!', table.result)
 
   type Row = { id: string; [key: string]: RowContentType };
 
   const rows: Row[] = [];
 
-  if(!table.result) // no tables
+  if(!table || !table.result || !table.result.reducerResults || !table.result.reducerResults.collection_group_results || !table.result.reducerResults.collection_group_results.blockIds) {
+    console.log('[getTableData] No table data found, returning empty rows');
     return { rows, schema: collectionRows };
+  }
 
   const tableArr: RowType[] = table.result.reducerResults.collection_group_results.blockIds.map(
     (id: string) => table.recordMap.block[id]
@@ -45,22 +48,40 @@ export const getTableData = async (
 
   const tableData = tableArr.filter(
     (b) =>
-      b.value && b.value.properties && b.value.parent_id === collection?.value.id
+      b && b.value && b.value.properties && b.value.parent_id === collection?.value.id
   );
-
 
   for (const td of tableData) {
     let row: Row = { id: td.value.id };
 
-    for (const key of collectionColKeys) {
+    // Get all property keys from the actual table data
+    const propertyKeys = Object.keys(td.value.properties || {});
+    
+    // Create a combined set of keys to check (schema keys + property keys)
+    const allKeys = new Set([...collectionColKeys, ...propertyKeys]);
+
+    for (const key of allKeys) {
       const val = td.value.properties[key];
       if (val) {
         const schema = collectionRows[key];
-        row[schema.name] = raw ? val : getNotionValue(val, schema.type, td);
-        // if (schema.type === "person" && row[schema.name]) {
-        //   const users = await fetchNotionUsers(row[schema.name] as string[]);
-        //   row[schema.name] = users as any;
-        // }
+        if (schema && schema.name) {
+          row[schema.name] = raw ? val : getNotionValue(val, schema.type, td);
+        } else {
+          // Try to find schema by matching property keys that might not be in collectionRows
+          const matchingSchemaEntry = Object.entries(collectionRows || {}).find(([schemaKey, schemaValue]) => {
+            // Add additional matching logic here if needed
+            return false; // placeholder for now
+          });
+          
+          if (matchingSchemaEntry) {
+            const [, matchingSchema] = matchingSchemaEntry;
+            row[matchingSchema.name] = raw ? val : getNotionValue(val, matchingSchema.type, td);
+          } else {
+            console.log(`[getTableData] Warning: No schema found for property key: ${key}`);
+            // Fallback: use the key itself as the property name
+            row[key] = raw ? val : val;
+          }
+        }
       }
     }
     rows.push(row);

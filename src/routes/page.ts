@@ -8,7 +8,7 @@ export async function pageRoute(req: HandlerRequest) {
   const pageId = parsePageId(req.params.pageId);
   const page = await fetchPageById(pageId!, req.notionToken);
 
-  console.log('->>>>>>', JSON.stringify(page, 0, 2), JSON.stringify(req.params, 0, 2))
+  // console.log('[pageRoute] Data:', JSON.stringify(page, 0, 2), JSON.stringify(req.params, 0, 2))
 
   if (!req.params.pageId) {
     console.error(`Page not found at [ID:${req.params.pageId}]`)
@@ -134,7 +134,7 @@ export async function pageRoute(req: HandlerRequest) {
       allBlocks[b] = {
         ...allBlocks[b],
         collection: {
-          title: coll?.value.name,
+          title: coll?.value?.name,
           schema,
           types: viewIds.map((id) => {
             const col = collPage.recordMap.collection_view[id];

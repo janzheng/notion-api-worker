@@ -9,6 +9,7 @@ import {
 } from "./types";
 
 const NOTION_API = "https://www.notion.so/api/v3";
+const NOTION_TIMEOUT_MS = 25000; // 25 seconds (Workers have 30s limit)
 
 interface INotionParams {
   resource: string;
@@ -25,29 +26,58 @@ const loadPageChunkBody = {
 
 let ctr=0
 
+// Timeout wrapper for fetch calls
+const fetchWithTimeout = async (url: string, options: RequestInit, timeoutMs: number): Promise<Response> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('Notion API request timed out');
+    }
+    throw err;
+  }
+};
+
 const fetchNotionData = async <T extends any>({
   resource,
   body,
   notionToken,
 }: INotionParams): Promise<T> => {
   try {
-    const res = await fetch(`${NOTION_API}/${resource}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "referer": "https://phagedirectory.notion.site",
-        "origin": "https://phagedirectory.notion.site",
-        ...(notionToken && { cookie: `token_v2=${notionToken}` }),
+    const res = await fetchWithTimeout(
+      `${NOTION_API}/${resource}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "referer": "https://phagedirectory.notion.site",
+          "origin": "https://phagedirectory.notion.site",
+          ...(notionToken && { cookie: `token_v2=${notionToken}` }),
+        },
+        body: JSON.stringify(body),
       },
-  
-      body: JSON.stringify(body),
-    });
+      NOTION_TIMEOUT_MS
+    );
+    
+    if (!res.ok) {
+      console.error('Notion API error:', res.status, res.statusText);
+      throw new Error('Notion API returned error: ' + res.status);
+    }
     
     let json = await res.json()
     return json;
   } catch(e) {
     console.error('fetchNotionData error:', e)
-    throw new Error('Failed to pull data from Notion')
+    throw new Error('Failed to pull data from Notion: ' + String(e))
   }
 };
 

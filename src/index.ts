@@ -17,6 +17,10 @@ export type Handler = (
   req: types.HandlerRequest
 ) => Promise<Response> | Response;
 
+// Cache timing constants
+const ONE_DAY = 60 * 60 * 24; // 86400 seconds
+const NINE_MONTHS = 60 * 60 * 24 * 270; // ~23,328,000 seconds
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "*",
@@ -24,7 +28,8 @@ const corsHeaders = {
   // "Cache-Control":`public, s-maxage=${30}, max-age=${60*60*0.1}, stale-while-revalidate=${60*4}`, 
   // 60s fresh cache but 7 day cache; max-age determines "freshness" and swr time is whenever the stlate data gets sent over
   // "Cache-Control":`public, s-maxage=${10}, max-age=${10}, stale-while-revalidate=${10}`, 
-  "Cache-Control":`public, s-maxage=${60}, max-age=${60}, stale-while-revalidate=${60*60}`, 
+  // "Cache-Control":`public, s-maxage=${60}, max-age=${60}, stale-while-revalidate=${60*60}`, 
+  "Cache-Control": `public, s-maxage=${ONE_DAY}, max-age=${ONE_DAY}, stale-while-revalidate=${NINE_MONTHS}`,
 };
 
 const router = new Router<Handler>();
@@ -93,15 +98,17 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
   }
 
   const cacheKey = getCacheKey(request);
-  let response;
+  let cachedResponse: Response | undefined;
 
   if (cacheKey) {
     try {
-      response = await cache.match(cacheKey);
-    } catch (err) {}
+      cachedResponse = await cache.match(cacheKey);
+    } catch (err) {
+      console.warn("Cache match failed:", err);
+    }
   }
 
-  const getResponseAndPersist = async () => {
+  const getResponseAndPersist = async (): Promise<Response> => {
     const res = await match.handler({
       request,
       searchParams,
@@ -109,22 +116,58 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
       notionToken,
     });
 
-    if (cache && cacheKey) {
-      await cache.put(cacheKey, res.clone());
+    // Only cache successful responses
+    if (cache && cacheKey && res.status >= 200 && res.status < 300) {
+      try {
+        await cache.put(cacheKey, res.clone());
+      } catch (err) {
+        console.warn("Cache put failed:", err);
+      }
     }
 
     return res;
   };
 
-  // console.log('responding ...')
-  if (response) {
-    fetchEvent.waitUntil(getResponseAndPersist());
-    return response;
+  // If we have a cached response, return it immediately and revalidate in background
+  if (cachedResponse) {
+    console.log("Returning cached response, revalidating in background");
+    fetchEvent.waitUntil(
+      getResponseAndPersist().catch((err) => {
+        console.error("Background revalidation failed:", err);
+      })
+    );
+    return cachedResponse;
   }
   
-  console.timeEnd("handleRequest"); // End timer
-
-  return getResponseAndPersist();
+  // No cache - try to fetch fresh data
+  try {
+    const freshResponse = await getResponseAndPersist();
+    console.timeEnd("handleRequest"); // End timer
+    return freshResponse;
+  } catch (err) {
+    console.error("Failed to fetch fresh data:", err);
+    
+    // If fresh fetch fails but we somehow have stale cache, return it
+    // (This is a fallback - normally cachedResponse would already be returned above)
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+    
+    // No cache and fetch failed - return error response
+    return new Response(
+      JSON.stringify({
+        error: "Service temporarily unavailable",
+        message: "Failed to fetch data from Notion. Please try again later.",
+      }),
+      {
+        status: 503,
+        headers: {
+          "Content-Type": "application/json",
+          ...corsHeaders,
+        },
+      }
+    );
+  }
 };
 
 
