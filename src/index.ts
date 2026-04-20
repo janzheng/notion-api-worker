@@ -164,6 +164,7 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
         headers: {
           "Content-Type": "application/json",
           ...corsHeaders,
+          "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         },
       }
     );

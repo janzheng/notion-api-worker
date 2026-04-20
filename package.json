@@ -8,7 +8,8 @@
     "dev": "wrangler dev --port 8787",
     "preview": "wrangler preview",
     "deploy": "wrangler deploy",
-    "prod": "wrangler deploy"
+    "prod": "wrangler deploy",
+    "test:smoke": "node scripts/smoke-test.mjs"
   },
   "dependencies": {
     "global": "^4.4.0",

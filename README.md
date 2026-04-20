@@ -45,6 +45,20 @@ Example ([Source Notion Page](https://www.notion.so/splitbee/20720198ca7a4e1b92a
 
 [`https://notion-api.splitbee.io/v1/table/20720198ca7a4e1b92af0a007d3b45a4`](https://notion-api.splitbee.io/v1/table/20720198ca7a4e1b92af0a007d3b45a4)
 
+## Smoke Tests
+
+Run a quick health check against `page`, `table`, and `collection` endpoints:
+
+`npm run test:smoke`
+
+Optional environment variables:
+
+- `SMOKE_BASE_URL` (default: `https://notion-cloudflare-worker.yawnxyz.workers.dev`)
+- `SMOKE_PAGE_ID` (default: `this-is-a-test-page-1c36478089c680b78e88cf7912a80221`)
+- `SMOKE_COLLECTION_PAGE_ID` (default: `3486478089c680a99742f5df13fec031`)
+- `SMOKE_TABLE_PAGE_ID` (defaults to `SMOKE_COLLECTION_PAGE_ID`)
+- `SMOKE_NOTION_TOKEN` (optional bearer token for private pages)
+
 ## Authentication for private pages
 
 All public pages can be accessed without authorization. If you want to fetch private pages there are two options.

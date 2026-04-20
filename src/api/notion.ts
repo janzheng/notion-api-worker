@@ -73,12 +73,80 @@ const fetchNotionData = async <T extends any>({
       throw new Error('Notion API returned error: ' + res.status);
     }
     
-    let json = await res.json()
-    return json;
+    let json = await res.json();
+    return normalizeNotionResponse(json) as T;
   } catch(e) {
     console.error('fetchNotionData error:', e)
     throw new Error('Failed to pull data from Notion: ' + String(e))
   }
+};
+
+type JSONObject = Record<string, any>;
+
+const unwrapNestedValueEntity = (entity: any) => {
+  if (!entity || typeof entity !== "object") {
+    return entity;
+  }
+
+  const nestedValue = entity.value;
+  if (
+    nestedValue &&
+    typeof nestedValue === "object" &&
+    nestedValue.value &&
+    typeof nestedValue.value === "object"
+  ) {
+    return {
+      ...entity,
+      value: nestedValue.value,
+      role:
+        entity.role !== undefined
+          ? entity.role
+          : nestedValue.role !== undefined
+          ? nestedValue.role
+          : entity.role,
+    };
+  }
+
+  return entity;
+};
+
+const normalizeRecordMap = (recordMap: JSONObject) => {
+  const normalized: JSONObject = { ...recordMap };
+
+  Object.keys(normalized).forEach((tableName) => {
+    const table = normalized[tableName];
+    if (!table || typeof table !== "object" || Array.isArray(table)) {
+      return;
+    }
+
+    const nextTable: JSONObject = { ...table };
+    Object.keys(nextTable).forEach((id) => {
+      nextTable[id] = unwrapNestedValueEntity(nextTable[id]);
+    });
+    normalized[tableName] = nextTable;
+  });
+
+  return normalized;
+};
+
+const normalizeNotionResponse = (json: any) => {
+  if (!json || typeof json !== "object") {
+    return json;
+  }
+
+  const normalized = { ...json };
+
+  if (normalized.recordMap && typeof normalized.recordMap === "object") {
+    normalized.recordMap = normalizeRecordMap(normalized.recordMap);
+  }
+
+  if (Array.isArray(normalized.results)) {
+    normalized.results = normalized.results.map((result: any) =>
+      unwrapNestedValueEntity(result)
+    );
+  }
+
+  return normalized;
 };
 
 export const fetchPageById = async (pageId: string, notionToken?: string) => {
