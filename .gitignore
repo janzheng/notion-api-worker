@@ -3,3 +3,4 @@ node_modules
 worker
 wrangler.toml
 .wrangler
+.DS_Store
