@@ -80,6 +80,51 @@ router.get("*", async () =>
 const cache = (caches as any).default;
 //const NOTION_API_TOKEN = process.env.NOTION_TOKEN // not implemented yet — use .env later
   // typeof env.NOTION_TOKEN !== "undefined" ? NOTION_TOKEN : undefined;
+const REVALIDATE_INTERVAL_MS = 30000;
+const REVALIDATE_JITTER_MS = 5000;
+const inFlightRevalidations = new Map<string, Promise<void>>();
+const lastRevalidateAt = new Map<string, number>();
+
+const shouldRevalidateNow = (cacheKey: string) => {
+  const lastRunAt = lastRevalidateAt.get(cacheKey) || 0;
+  const minInterval =
+    REVALIDATE_INTERVAL_MS + Math.floor(Math.random() * REVALIDATE_JITTER_MS);
+  const now = Date.now();
+  if (now - lastRunAt < minInterval) {
+    return false;
+  }
+  lastRevalidateAt.set(cacheKey, now);
+  return true;
+};
+
+const scheduleRevalidation = (
+  fetchEvent: FetchEvent,
+  cacheKey: string | null,
+  refreshFn: () => Promise<Response>
+) => {
+  if (!cacheKey) {
+    return;
+  }
+
+  if (inFlightRevalidations.has(cacheKey)) {
+    return;
+  }
+
+  if (!shouldRevalidateNow(cacheKey)) {
+    return;
+  }
+
+  const revalidation = refreshFn()
+    .catch((err) => {
+      console.error("Background revalidation failed:", err);
+    })
+    .finally(() => {
+      inFlightRevalidations.delete(cacheKey);
+    });
+
+  inFlightRevalidations.set(cacheKey, revalidation);
+  fetchEvent.waitUntil(revalidation);
+};
 
 const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
   console.time("handleRequest"); // Start timer
@@ -101,11 +146,9 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
   const bypassCache = isCacheBypass(request);
   let cachedResponse: Response | undefined;
 
-  // Skip cache lookup on bypass, but still hold on to the stale entry if
-  // one exists — if the fresh fetch below fails, we fall back to stale.
-  // On a successful bypass fetch, the response is written to the stripped
-  // (canonical) cache key below, so the bare URL also gets fresh on next hit.
-  if (cacheKey && !bypassCache) {
+  // Always check cache so bypass requests can still fall back to stale if
+  // fresh fetch fails. Bypass only changes read behavior below.
+  if (cacheKey) {
     try {
       cachedResponse = await cache.match(cacheKey);
     } catch (err) {
@@ -134,13 +177,9 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
   };
 
   // If we have a cached response, return it immediately and revalidate in background
-  if (cachedResponse) {
+  if (cachedResponse && !bypassCache) {
     console.log("Returning cached response, revalidating in background");
-    fetchEvent.waitUntil(
-      getResponseAndPersist().catch((err) => {
-        console.error("Background revalidation failed:", err);
-      })
-    );
+    scheduleRevalidation(fetchEvent, cacheKey, getResponseAndPersist);
     return cachedResponse;
   }
   

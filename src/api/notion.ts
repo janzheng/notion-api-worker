@@ -10,6 +10,10 @@ import {
 
 const NOTION_API = "https://www.notion.so/api/v3";
 const NOTION_TIMEOUT_MS = 25000; // 25 seconds (Workers have 30s limit)
+const NOTION_MAX_RETRIES = 3;
+const NOTION_RETRY_BASE_MS = 400;
+const NOTION_RETRY_MAX_MS = 8000;
+const NOTION_MAX_CONCURRENCY = 4;
 
 interface INotionParams {
   resource: string;
@@ -24,7 +28,112 @@ const loadPageChunkBody = {
   verticalColumns: false,
 };
 
-let ctr=0
+class AsyncSemaphore {
+  private activeCount = 0;
+  private queue: Array<() => void> = [];
+  private maxConcurrency: number;
+
+  constructor(maxConcurrency: number) {
+    this.maxConcurrency = Math.max(1, maxConcurrency);
+  }
+
+  private acquire = async (): Promise<void> => {
+    if (this.activeCount < this.maxConcurrency) {
+      this.activeCount += 1;
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      this.queue.push(() => {
+        this.activeCount += 1;
+        resolve();
+      });
+    });
+  };
+
+  private release = () => {
+    this.activeCount = Math.max(0, this.activeCount - 1);
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    }
+  };
+
+  withPermit = async <T>(fn: () => Promise<T>): Promise<T> => {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  };
+}
+
+const notionRequestSemaphore = new AsyncSemaphore(NOTION_MAX_CONCURRENCY);
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const getJitteredBackoffDelay = (attempt: number) => {
+  const baseDelay = Math.min(
+    NOTION_RETRY_MAX_MS,
+    NOTION_RETRY_BASE_MS * Math.pow(2, attempt)
+  );
+  const jitterMultiplier = 0.75 + Math.random() * 0.5; // 0.75x - 1.25x
+  return Math.floor(baseDelay * jitterMultiplier);
+};
+
+const parseRetryAfterMs = (retryAfterValue: string | null): number | null => {
+  if (!retryAfterValue) {
+    return null;
+  }
+
+  const seconds = Number(retryAfterValue);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.floor(seconds * 1000));
+  }
+
+  const retryAt = Date.parse(retryAfterValue);
+  if (Number.isNaN(retryAt)) {
+    return null;
+  }
+
+  return Math.max(0, retryAt - Date.now());
+};
+
+const getRetryDelayMs = (attempt: number, retryAfterValue: string | null) => {
+  const retryAfterMs = parseRetryAfterMs(retryAfterValue);
+  if (retryAfterMs !== null) {
+    return Math.min(NOTION_RETRY_MAX_MS, retryAfterMs);
+  }
+  return getJitteredBackoffDelay(attempt);
+};
+
+const isRetryableStatus = (status: number) => {
+  return status === 429 || status === 408 || status >= 500;
+};
+
+const isRetryableError = (err: unknown) => {
+  if (!err) {
+    return false;
+  }
+
+  if (err instanceof TypeError) {
+    return true;
+  }
+
+  if (err instanceof Error) {
+    const message = err.message.toLowerCase();
+    return (
+      message.includes("timed out") ||
+      message.includes("timeout") ||
+      message.includes("network") ||
+      message.includes("fetch")
+    );
+  }
+
+  return false;
+};
 
 // Timeout wrapper for fetch calls
 const fetchWithTimeout = async (url: string, options: RequestInit, timeoutMs: number): Promise<Response> => {
@@ -53,28 +162,83 @@ const fetchNotionData = async <T extends any>({
   notionToken,
 }: INotionParams): Promise<T> => {
   try {
-    const res = await fetchWithTimeout(
-      `${NOTION_API}/${resource}`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "referer": "https://phagedirectory.notion.site",
-          "origin": "https://phagedirectory.notion.site",
-          ...(notionToken && { cookie: `token_v2=${notionToken}` }),
-        },
-        body: JSON.stringify(body),
-      },
-      NOTION_TIMEOUT_MS
-    );
-    
-    if (!res.ok) {
-      console.error('Notion API error:', res.status, res.statusText);
-      throw new Error('Notion API returned error: ' + res.status);
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= NOTION_MAX_RETRIES; attempt++) {
+      try {
+        const res = await notionRequestSemaphore.withPermit(() =>
+          fetchWithTimeout(
+            `${NOTION_API}/${resource}`,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "referer": "https://phagedirectory.notion.site",
+                "origin": "https://phagedirectory.notion.site",
+                ...(notionToken && { cookie: `token_v2=${notionToken}` }),
+              },
+              body: JSON.stringify(body),
+            },
+            NOTION_TIMEOUT_MS
+          )
+        );
+
+        if (res.ok) {
+          let json = await res.json();
+          return normalizeNotionResponse(json) as T;
+        }
+
+        const status = res.status;
+        const statusText = res.statusText;
+        const responseSnippet = await res.text().catch(() => "");
+        const shouldRetry = isRetryableStatus(status) && attempt < NOTION_MAX_RETRIES;
+
+        if (shouldRetry) {
+          const retryDelayMs = getRetryDelayMs(
+            attempt,
+            res.headers.get("retry-after")
+          );
+          console.warn(
+            "Retrying Notion API request",
+            resource,
+            "status:",
+            status,
+            "attempt:",
+            attempt + 1,
+            "delayMs:",
+            retryDelayMs
+          );
+          await sleep(retryDelayMs);
+          continue;
+        }
+
+        console.error("Notion API error:", status, statusText);
+        throw new Error(
+          "Notion API returned error: " +
+            status +
+            (responseSnippet ? " - " + responseSnippet.slice(0, 160) : "")
+        );
+      } catch (err: unknown) {
+        lastError = err;
+        const shouldRetry = isRetryableError(err) && attempt < NOTION_MAX_RETRIES;
+        if (shouldRetry) {
+          const retryDelayMs = getJitteredBackoffDelay(attempt);
+          console.warn(
+            "Retrying Notion API request after error",
+            resource,
+            "attempt:",
+            attempt + 1,
+            "delayMs:",
+            retryDelayMs
+          );
+          await sleep(retryDelayMs);
+          continue;
+        }
+        throw err;
+      }
     }
-    
-    let json = await res.json();
-    return normalizeNotionResponse(json) as T;
+
+    throw lastError || new Error("Unknown error while fetching Notion data");
   } catch(e) {
     console.error('fetchNotionData error:', e)
     throw new Error('Failed to pull data from Notion: ' + String(e))
