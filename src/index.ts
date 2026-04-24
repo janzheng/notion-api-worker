@@ -10,7 +10,7 @@ import { blockRoute } from "./routes/block";
 import { fileRoute } from "./routes/file";
 import { searchRoute } from "./routes/search";
 import { createResponse } from "./response";
-import { getCacheKey } from "./get-cache-key";
+import { getCacheKey, isCacheBypass } from "./get-cache-key";
 import * as types from "./api/types";
 
 export type Handler = (
@@ -98,9 +98,14 @@ const handleRequest = async (fetchEvent: FetchEvent): Promise<Response> => {
   }
 
   const cacheKey = getCacheKey(request);
+  const bypassCache = isCacheBypass(request);
   let cachedResponse: Response | undefined;
 
-  if (cacheKey) {
+  // Skip cache lookup on bypass, but still hold on to the stale entry if
+  // one exists — if the fresh fetch below fails, we fall back to stale.
+  // On a successful bypass fetch, the response is written to the stripped
+  // (canonical) cache key below, so the bare URL also gets fresh on next hit.
+  if (cacheKey && !bypassCache) {
     try {
       cachedResponse = await cache.match(cacheKey);
     } catch (err) {
